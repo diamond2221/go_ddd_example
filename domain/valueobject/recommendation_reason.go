@@ -30,9 +30,17 @@ const (
 // 实际业务场景：
 // 用户看到推荐时，会显示"3 位你关注的人也关注了TA"
 // 这个文案的生成逻辑就封装在这个值对象中
+//
+// 重构说明（支持后端配置文案）：
+// 新增 displayText 字段，用于存储后端返回的配置文案。
+// 这样做的好处：
+// 1. 后端可以动态配置文案（A/B测试、多语言、运营活动等）
+// 2. 前端保留降级逻辑，后端接口异常时不影响用户体验
+// 3. 渐进式迁移，不需要前后端同时上线
 type RecommendationReason struct {
 	reasonType   ReasonType
 	relatedUsers []UserID // 哪些关注的人关注了这个推荐用户
+	displayText  string   // 后端配置的展示文案（可选，为空时使用本地逻辑）
 }
 
 // NewFollowedByFollowingReason 工厂方法：创建"关注的人关注了TA"类型的推荐理由
@@ -40,6 +48,7 @@ func NewFollowedByFollowingReason(users []UserID) RecommendationReason {
 	return RecommendationReason{
 		reasonType:   ReasonFollowedByFollowing,
 		relatedUsers: users,
+		displayText:  "", // 使用本地逻辑生成文案
 	}
 }
 
@@ -48,34 +57,97 @@ func NewPopularInNetworkReason(users []UserID) RecommendationReason {
 	return RecommendationReason{
 		reasonType:   ReasonPopularInNetwork,
 		relatedUsers: users,
+		displayText:  "", // 使用本地逻辑生成文案
+	}
+}
+
+// NewRecommendationReasonWithText 工厂方法：创建带后端配置文案的推荐理由
+//
+// 这个工厂方法用于从后端接口数据创建推荐理由。
+//
+// 使用场景：
+// 在 Application Service 或 DTO 转换层，将后端返回的数据映射到领域对象时使用。
+//
+// 示例：
+//
+//	// 后端返回的数据
+//	apiResponse := {
+//	    "reasonType": "followed_by_following",
+//	    "displayText": "3 位你关注的人也关注了TA",
+//	    "relatedUserIds": ["user1", "user2", "user3"]
+//	}
+//
+//	// 在 Application Service 中转换
+//	reason := NewRecommendationReasonWithText(
+//	    ReasonFollowedByFollowing,
+//	    userIDs,
+//	    apiResponse.DisplayText,  // 使用后端配置的文案
+//	)
+//
+// 设计思路：
+// 1. 保持值对象的不可变性（通过工厂方法创建）
+// 2. 明确区分"本地创建"和"从后端创建"两种场景
+// 3. 为未来的扩展留出空间（如添加更多配置参数）
+func NewRecommendationReasonWithText(reasonType ReasonType, users []UserID, displayText string) RecommendationReason {
+	return RecommendationReason{
+		reasonType:   reasonType,
+		relatedUsers: users,
+		displayText:  displayText, // 使用后端配置的文案
 	}
 }
 
 // Description 生成用户可读的推荐理由描述
 //
-// 这个方法展示了值对象如何封装展示逻辑。
+// 重构后的逻辑（渐进式迁移）：
+// 1. 优先使用后端配置的文案（displayText）
+// 2. 如果后端没有返回文案，降级到本地逻辑
 //
-// 为什么展示逻辑在领域层？
-// 因为"如何描述推荐理由"是业务规则，不是技术细节。
-// 产品经理定义了文案规则：
-// - 1个人关注：显示"1 位你关注的人也关注了TA"
-// - 多个人关注：显示"N 位你关注的人也关注了TA"
+// 为什么这样设计？
+//
+// 【优先使用后端配置】
+// - 后端可以动态调整文案，无需发版
+// - 支持 A/B 测试（不同用户看到不同文案）
+// - 支持多语言（后端根据用户语言返回对应文案）
+// - 支持运营活动（如节日特殊文案）
+//
+// 【保留本地降级逻辑】
+// - 后端接口异常时，前端仍能正常展示
+// - 兼容旧版本后端（还没有返回 displayText 的版本）
+// - 灰度发布时，部分用户使用新逻辑，部分使用旧逻辑
+// - 降低上线风险，可以随时回滚
 //
 // 实际场景：
 //
-//	reason := NewFollowedByFollowingReason([]UserID{user1, user2, user3})
-//	desc := reason.Description() // "3 位你关注的人也关注了TA"
+//	// 场景1：后端返回了配置文案
+//	reason1 := NewRecommendationReasonWithText(
+//	    ReasonFollowedByFollowing,
+//	    []UserID{user1, user2, user3},
+//	    "你的 3 位好友也关注了TA", // 后端配置的新文案
+//	)
+//	desc1 := reason1.Description() // "你的 3 位好友也关注了TA"
 //
-// 国际化考虑：
-// 如果需要支持多语言，可以：
-// 1. 返回 key，由外层翻译
-// 2. 传入 locale 参数
-// 3. 使用 i18n 库
+//	// 场景2：后端还没有返回配置文案（兼容旧版本）
+//	reason2 := NewFollowedByFollowingReason([]UserID{user1, user2, user3})
+//	desc2 := reason2.Description() // "3 位你关注的人也关注了TA"（降级到本地逻辑）
 //
-// 为什么不在前端生成文案？
-// 因为文案规则是业务规则，应该由后端控制。
-// 前端只负责展示，不应该包含业务逻辑。
+// 迁移路径：
+// 第1周：前端部署这个版本（支持 displayText，但保留降级逻辑）
+// 第2周：后端灰度发布，开始返回 displayText
+// 第3周：观察数据，确认稳定
+// 第4周：后端全量发布
+// 第N周：当确认后端稳定后，可以删除 switch 降级逻辑（可选）
+//
+// 注意事项：
+// - displayText 为空字符串时，会使用本地逻辑
+// - 后端应该保证返回的文案不为空，否则会降级
+// - 如果需要强制使用后端文案（即使为空），可以增加一个标志位
 func (r RecommendationReason) Description() string {
+	// 优先使用后端配置的文案
+	if r.displayText != "" {
+		return r.displayText
+	}
+
+	// 降级到本地逻辑（兼容旧版本或后端异常）
 	switch r.reasonType {
 	case ReasonFollowedByFollowing:
 		count := len(r.relatedUsers)

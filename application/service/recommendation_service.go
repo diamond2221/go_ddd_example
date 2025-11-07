@@ -61,10 +61,11 @@ import (
 // 传统方式：所有逻辑都在 Service 层，业务规则和技术细节混在一起
 // DDD 方式：业务规则在领域层，应用服务只负责编排
 type RecommendationService struct {
-	generator       *service.RecommendationGenerator
-	socialGraphRepo repository.SocialGraphRepository
-	contentRepo     repository.ContentRepository
-	userRPCClient   UserRPCClient // 调用 user 服务获取用户信息
+	generator          *service.RecommendationGenerator
+	socialGraphRepo    repository.SocialGraphRepository
+	contentRepo        repository.ContentRepository
+	userRPCClient      UserRPCClient          // 调用 user 服务获取用户信息
+	reasonConfigClient ReasonTextConfigClient // 调用配置服务获取推荐理由文案（可选）
 }
 
 // UserRPCClient 用户服务RPC客户端接口
@@ -72,6 +73,16 @@ type RecommendationService struct {
 type UserRPCClient interface {
 	GetUserInfo(ctx context.Context, userID int64) (*UserInfo, error)
 	GetUserInfoBatch(ctx context.Context, userIDs []int64) ([]*UserInfo, error)
+}
+
+// ReasonTextConfigClient 推荐理由文案配置服务客户端接口
+// 用于从配置服务获取推荐理由的展示文案
+type ReasonTextConfigClient interface {
+	// GetReasonText 获取推荐理由的展示文案
+	// reasonType: 推荐理由类型（如 "followed_by_following"）
+	// count: 相关用户数量（用于生成文案，如 "3 位你关注的人"）
+	// 返回配置的文案，如果配置服务异常或没有配置，返回空字符串（会降级到本地逻辑）
+	GetReasonText(ctx context.Context, reasonType string, count int) (string, error)
 }
 
 // UserInfo 用户信息（来自 user 服务）
@@ -83,17 +94,20 @@ type UserInfo struct {
 }
 
 // NewRecommendationService 构造函数
+// reasonConfigClient 可以为 nil，表示不使用配置服务（降级到本地逻辑）
 func NewRecommendationService(
 	generator *service.RecommendationGenerator,
 	socialGraphRepo repository.SocialGraphRepository,
 	contentRepo repository.ContentRepository,
 	userRPCClient UserRPCClient,
+	reasonConfigClient ReasonTextConfigClient,
 ) *RecommendationService {
 	return &RecommendationService{
-		generator:       generator,
-		socialGraphRepo: socialGraphRepo,
-		contentRepo:     contentRepo,
-		userRPCClient:   userRPCClient,
+		generator:          generator,
+		socialGraphRepo:    socialGraphRepo,
+		contentRepo:        contentRepo,
+		userRPCClient:      userRPCClient,
+		reasonConfigClient: reasonConfigClient,
 	}
 }
 
@@ -184,13 +198,16 @@ func (s *RecommendationService) GetFollowingBasedRecommendations(
 			posts = nil // 容错：获取失败不影响推荐
 		}
 
+		// 获取推荐理由文案（优先使用配置服务）
+		reasonText := s.getReasonText(ctx, rec.Reason())
+
 		// 转换为 DTO
 		recommendationDTO := &dto.UserRecommendationDTO{
 			UserID:      rec.TargetUserID().Value(),
 			Username:    userInfo.Username,
 			Avatar:      userInfo.Avatar,
 			Bio:         userInfo.Bio,
-			Reason:      rec.Reason().Description(),
+			Reason:      reasonText,
 			Score:       rec.Score(),
 			RecentPosts: s.convertPostsToDTO(posts),
 		}
@@ -233,4 +250,74 @@ func (s *RecommendationService) convertPostsToDTO(posts []*entity.Post) []*dto.P
 		})
 	}
 	return result
+}
+
+// getReasonText 辅助方法：获取推荐理由文案
+//
+// 这个方法展示了如何在应用层集成配置服务，同时保持降级能力。
+//
+// 设计思路：
+// 1. 优先尝试从配置服务获取文案（如果配置了 reasonConfigClient）
+// 2. 如果配置服务不可用或返回空，降级到领域对象的本地逻辑
+// 3. 保证无论配置服务是否可用，都能正常展示推荐理由
+//
+// 为什么在应用层而不是领域层？
+// - 调用 HTTP 服务是基础设施细节，不应该污染领域层
+// - 配置文案更像是展示层的关注点，不是核心业务规则
+// - 应用层负责协调外部服务，这正是它的职责
+//
+// 实际场景：
+//
+//	// 场景1：配置服务正常
+//	reasonConfigClient 返回 "你的 3 位好友也关注了TA"
+//	→ 使用配置服务的文案
+//
+//	// 场景2：配置服务异常或未配置
+//	reasonConfigClient 为 nil 或返回错误
+//	→ 降级到 reason.Description()（本地逻辑）
+//
+//	// 场景3：配置服务返回空字符串
+//	reasonConfigClient 返回 ""
+//	→ 降级到 reason.Description()（本地逻辑）
+//
+// 容错设计：
+// - reasonConfigClient 可以为 nil（表示不使用配置服务）
+// - 配置服务调用失败不影响推荐功能
+// - 配置服务返回空字符串时降级到本地逻辑
+//
+// 扩展性：
+// 未来可以添加更多逻辑：
+// - 缓存配置文案（减少 HTTP 调用）
+// - A/B 测试（根据用户分组返回不同文案）
+// - 多语言支持（根据用户语言返回对应文案）
+func (s *RecommendationService) getReasonText(ctx context.Context, reason valueobject.RecommendationReason) string {
+	// 如果没有配置客户端，直接使用本地逻辑
+	if s.reasonConfigClient == nil {
+		return reason.Description()
+	}
+
+	// 将领域对象的类型转换为配置服务的类型标识
+	var reasonType string
+	switch reason.Type() {
+	case valueobject.ReasonFollowedByFollowing:
+		reasonType = "followed_by_following"
+	case valueobject.ReasonPopularInNetwork:
+		reasonType = "popular_in_network"
+	default:
+		reasonType = "default"
+	}
+
+	// 尝试从配置服务获取文案
+	configText, err := s.reasonConfigClient.GetReasonText(
+		ctx,
+		reasonType,
+		len(reason.RelatedUsers()),
+	)
+
+	// 容错处理：配置服务异常或返回空，降级到本地逻辑
+	if err != nil || configText == "" {
+		return reason.Description()
+	}
+
+	return configText
 }

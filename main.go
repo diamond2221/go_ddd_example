@@ -4,6 +4,10 @@ import (
 	"log"
 	"net"
 
+	"service/application/service"
+	domainService "service/domain/service"
+	"service/infrastructure/client"
+	"service/infrastructure/repository"
 	"service/interface/handler"
 	"service/rpc_gen/kitex_gen/recommendation/recommendationservice"
 
@@ -75,7 +79,7 @@ func main() {
 // - 或者自己实现的 IoC 容器
 type Dependencies struct {
 	// 应用服务
-	// RecommendationService *service.RecommendationService
+	RecommendationService *service.RecommendationService
 
 	// 领域服务
 	// RecommendationGenerator *domainservice.RecommendationGenerator
@@ -87,53 +91,20 @@ type Dependencies struct {
 	// 基础设施
 	// DB          *gorm.DB
 	// RedisClient *redis.Client
-	// UserRPC     UserRPCClient
-
-	// 为了示例简化，这里用 interface{} 代替
-	RecommendationService interface{}
+	// UserRPC     service.UserRPCClient
+	// ReasonConfigClient service.ReasonTextConfigClient
 }
 
 // initDependencies 初始化依赖
 //
 // 这是依赖注入的核心函数，负责创建和组装所有依赖。
 //
-// 实际项目中的完整实现：
-//
-//	func initDependencies() *Dependencies {
-//	    // 1. 加载配置
-//	    cfg := config.Load()
-//
-//	    // 2. 初始化数据库
-//	    db := initDB(cfg.Database)
-//
-//	    // 3. 初始化 Redis
-//	    redis := initRedis(cfg.Redis)
-//
-//	    // 4. 初始化 RPC 客户端
-//	    userRPC := initUserRPCClient(cfg.UserService)
-//
-//	    // 5. 创建仓储实现（基础设施层）
-//	    socialGraphRepo := persistence.NewSocialGraphRepository(db)
-//	    contentRepo := persistence.NewContentRepository(db)
-//
-//	    // 6. 创建领域服务（领域层）
-//	    generator := domainservice.NewRecommendationGenerator(
-//	        socialGraphRepo,
-//	        contentRepo,
-//	    )
-//
-//	    // 7. 创建应用服务（应用层）
-//	    recommendationService := service.NewRecommendationService(
-//	        generator,
-//	        socialGraphRepo,
-//	        contentRepo,
-//	        userRPC,
-//	    )
-//
-//	    return &Dependencies{
-//	        RecommendationService: recommendationService,
-//	    }
-//	}
+// DDD 分层依赖注入顺序（从内到外）：
+// 1. 基础设施层：数据库、Redis、RPC 客户端
+// 2. 仓储层：实现领域仓储接口
+// 3. 领域服务层：实现核心业务逻辑
+// 4. 应用服务层：编排用例
+// 5. 接口层：处理外部请求
 //
 // 依赖注入的好处：
 // 1. 控制反转：依赖由外部注入，不在内部创建
@@ -141,20 +112,67 @@ type Dependencies struct {
 // 3. 解耦：各层不直接依赖具体实现
 // 4. 灵活配置：可以根据环境注入不同实现
 func initDependencies() *Dependencies {
-	// 这里是简化版本，实际项目中需要完整实现
-	// 参考上面的注释
-
 	log.Println("Initializing dependencies...")
 
-	// TODO: 实际项目中在这里初始化所有依赖
-	// - 数据库连接
-	// - 仓储实现
-	// - 领域服务
-	// - 应用服务
-	// - RPC 客户端
+	// 1. 初始化基础设施（数据库、缓存、RPC 客户端等）
+	// 在实际项目中，这里会：
+	// - 加载配置文件
+	// - 初始化数据库连接
+	// - 初始化 Redis 连接
+	// db := initDB(cfg.Database)
+	// redis := initRedis(cfg.Redis)
+
+	// 2. 初始化 RPC 客户端
+	// userRPCClient := initUserRPCClient(cfg.UserService)
+	// 示例：使用 mock 实现
+	userRPCClient := repository.NewMockUserRPCClient()
+
+	// 3. 初始化推荐理由配置服务客户端（可选）
+	// 方式1：使用真实的配置服务
+	// reasonConfigClient := client.NewReasonTextConfigHTTPClient("http://config-service:8080")
+	//
+	// 方式2：不使用配置服务（传 nil，会降级到本地逻辑）
+	var reasonConfigClient service.ReasonTextConfigClient = nil
+	//
+	// 方式3：通过环境变量或配置文件控制
+	// if os.Getenv("USE_REASON_CONFIG") == "true" {
+	//     reasonConfigClient = client.NewReasonTextConfigHTTPClient(os.Getenv("CONFIG_SERVICE_URL"))
+	// }
+	//
+	// 注意：client.NewReasonTextConfigHTTPClient 已经在 infrastructure/client 包中实现
+	// 如果需要使用，取消注释上面的代码即可
+	_ = client.NewReasonTextConfigHTTPClient // 避免 unused import 警告
+
+	// 4. 创建仓储实现（基础设施层 → 领域层接口）
+	// 在实际项目中，这里会创建真实的数据库仓储
+	// socialGraphRepo := persistence.NewMySQLSocialGraphRepository(db)
+	// contentRepo := persistence.NewMySQLContentRepository(db)
+	//
+	// 示例：使用 mock 实现
+	socialGraphRepo := repository.NewMockSocialGraphRepository()
+	contentRepo := repository.NewMockContentRepository()
+
+	// 5. 创建领域服务（领域层）
+	// 领域服务依赖仓储接口，不依赖具体实现
+	generator := domainService.NewRecommendationGenerator(
+		socialGraphRepo,
+		contentRepo,
+	)
+
+	// 6. 创建应用服务（应用层）
+	// 应用服务依赖领域服务、仓储、RPC 客户端
+	recommendationService := service.NewRecommendationService(
+		generator,
+		socialGraphRepo,
+		contentRepo,
+		userRPCClient,
+		reasonConfigClient, // 可以为 nil
+	)
+
+	log.Println("Dependencies initialized successfully")
 
 	return &Dependencies{
-		RecommendationService: nil, // 实际项目中返回真实的服务实例
+		RecommendationService: recommendationService,
 	}
 }
 
