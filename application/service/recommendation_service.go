@@ -63,9 +63,10 @@ import (
 type RecommendationService struct {
 	generator          *service.RecommendationGenerator
 	socialGraphRepo    repository.SocialGraphRepository
-	contentRepo        repository.ContentRepository
-	userRPCClient      UserRPCClient          // 调用 user 服务获取用户信息
-	reasonConfigClient ReasonTextConfigClient // 调用配置服务获取推荐理由文案（可选）
+	contentRepo        repository.ContentRepository // 本地数据库查询（可选）
+	contentClient      ContentServiceClient         // 远程服务调用（可选）
+	userRPCClient      UserRPCClient                // 调用 user 服务获取用户信息
+	reasonConfigClient ReasonTextConfigClient       // 调用配置服务获取推荐理由文案（可选）
 }
 
 // UserRPCClient 用户服务RPC客户端接口
@@ -73,6 +74,27 @@ type RecommendationService struct {
 type UserRPCClient interface {
 	GetUserInfo(ctx context.Context, userID int64) (*UserInfo, error)
 	GetUserInfoBatch(ctx context.Context, userIDs []int64) ([]*UserInfo, error)
+}
+
+// ContentServiceClient 内容服务RPC客户端接口
+// 如果帖子数据来自其他微服务（而不是直接查数据库），使用这个接口
+//
+// 使用场景：
+// - 内容服务是独立的微服务
+// - 帖子数据不在当前服务的数据库
+// - 需要通过 RPC/HTTP 调用获取帖子
+//
+// 对比：
+// - ContentRepository：直接查询本地数据库（基础设施层）
+// - ContentServiceClient：调用远程服务（应用层）
+//
+// 选择哪个？
+// 1. 如果帖子数据在本地数据库 → 使用 ContentRepository
+// 2. 如果帖子数据在其他服务 → 使用 ContentServiceClient
+// 3. 如果两者都有 → 可以同时注入，根据场景选择
+type ContentServiceClient interface {
+	// GetRecentPosts 获取用户最近的帖子（从远程服务）
+	GetRecentPosts(ctx context.Context, userID int64, limit int) ([]*PostInfo, error)
 }
 
 // ReasonTextConfigClient 推荐理由文案配置服务客户端接口
@@ -93,12 +115,34 @@ type UserInfo struct {
 	Bio      string
 }
 
+// PostInfo 帖子信息（来自 content 服务）
+type PostInfo struct {
+	PostID    int64
+	Content   string
+	CreatedAt string
+}
+
 // NewRecommendationService 构造函数
-// reasonConfigClient 可以为 nil，表示不使用配置服务（降级到本地逻辑）
+//
+// 参数说明：
+// - contentRepo: 本地数据库查询（可以为 nil）
+// - contentClient: 远程服务调用（可以为 nil）
+// - reasonConfigClient: 配置服务（可以为 nil）
+//
+// 灵活配置：
+// 1. 只使用本地数据库：contentRepo != nil, contentClient = nil
+// 2. 只使用远程服务：contentRepo = nil, contentClient != nil
+// 3. 两者都用：contentRepo != nil, contentClient != nil（优先使用远程服务）
+//
+// 实际场景：
+// - 单体应用：只传 contentRepo
+// - 微服务架构：只传 contentClient
+// - 混合架构：两者都传，优先远程服务，失败时降级到本地
 func NewRecommendationService(
 	generator *service.RecommendationGenerator,
 	socialGraphRepo repository.SocialGraphRepository,
 	contentRepo repository.ContentRepository,
+	contentClient ContentServiceClient,
 	userRPCClient UserRPCClient,
 	reasonConfigClient ReasonTextConfigClient,
 ) *RecommendationService {
@@ -106,6 +150,7 @@ func NewRecommendationService(
 		generator:          generator,
 		socialGraphRepo:    socialGraphRepo,
 		contentRepo:        contentRepo,
+		contentClient:      contentClient,
 		userRPCClient:      userRPCClient,
 		reasonConfigClient: reasonConfigClient,
 	}
@@ -193,10 +238,8 @@ func (s *RecommendationService) GetFollowingBasedRecommendations(
 		}
 
 		// 获取用户最近的帖子
-		posts, err := s.contentRepo.GetRecentPosts(ctx, rec.TargetUserID(), 3)
-		if err != nil {
-			posts = nil // 容错：获取失败不影响推荐
-		}
+		// 优先使用远程服务，失败时降级到本地数据库
+		posts := s.getRecentPosts(ctx, rec.TargetUserID().Value(), 3)
 
 		// 获取推荐理由文案（优先使用配置服务）
 		reasonText := s.getReasonText(ctx, rec.Reason())
@@ -209,7 +252,7 @@ func (s *RecommendationService) GetFollowingBasedRecommendations(
 			Bio:         userInfo.Bio,
 			Reason:      reasonText,
 			Score:       rec.Score(),
-			RecentPosts: s.convertPostsToDTO(posts),
+			RecentPosts: posts,
 		}
 
 		response.Recommendations = append(response.Recommendations, recommendationDTO)
@@ -233,6 +276,75 @@ func (s *RecommendationService) getUserInfoMap(
 		result[info.UserID] = info
 	}
 	return result, nil
+}
+
+// getRecentPosts 辅助方法：获取用户最近的帖子
+//
+// 这个方法展示了如何在微服务架构中处理跨服务调用，同时保持降级能力。
+//
+// 调用策略（优先级从高到低）：
+// 1. 优先使用远程服务（contentClient）
+// 2. 如果远程服务不可用或失败，降级到本地数据库（contentRepo）
+// 3. 如果都失败，返回空列表（容错）
+//
+// 为什么需要这种设计？
+// - 微服务架构：帖子数据可能在其他服务
+// - 容错性：远程服务不可用时不影响推荐功能
+// - 灵活性：支持单体和微服务两种架构
+//
+// 实际场景：
+//
+//	// 场景1：纯微服务架构
+//	contentClient != nil, contentRepo = nil
+//	→ 只调用远程服务
+//
+//	// 场景2：单体应用
+//	contentClient = nil, contentRepo != nil
+//	→ 只查本地数据库
+//
+//	// 场景3：混合架构（推荐）
+//	contentClient != nil, contentRepo != nil
+//	→ 优先远程服务，失败时降级到本地
+//
+// 性能考虑：
+// - 远程调用失败不重试（避免级联延迟）
+// - 降级到本地数据库（快速响应）
+// - 最坏情况返回空列表（不阻塞推荐）
+func (s *RecommendationService) getRecentPosts(ctx context.Context, userID int64, limit int) []*dto.PostDTO {
+	// 策略1：优先使用远程服务
+	if s.contentClient != nil {
+		posts, err := s.contentClient.GetRecentPosts(ctx, userID, limit)
+		if err == nil && posts != nil {
+			// 转换 PostInfo → PostDTO
+			result := make([]*dto.PostDTO, 0, len(posts))
+			for _, post := range posts {
+				result = append(result, &dto.PostDTO{
+					PostID:    post.PostID,
+					Content:   post.Content,
+					CreatedAt: post.CreatedAt,
+				})
+			}
+			return result
+		}
+		// 远程服务失败，继续尝试本地数据库
+	}
+
+	// 策略2：降级到本地数据库
+	if s.contentRepo != nil {
+		domainUserID, err := valueobject.NewUserID(userID)
+		if err != nil {
+			return []*dto.PostDTO{} // 容错：ID 无效
+		}
+
+		posts, err := s.contentRepo.GetRecentPosts(ctx, domainUserID, limit)
+		if err == nil && posts != nil {
+			return s.convertPostsToDTO(posts)
+		}
+		// 本地数据库也失败，返回空列表
+	}
+
+	// 策略3：容错 - 返回空列表
+	return []*dto.PostDTO{}
 }
 
 // convertPostsToDTO 辅助方法：转换帖子实体为 DTO
