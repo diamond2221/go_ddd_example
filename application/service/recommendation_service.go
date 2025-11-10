@@ -226,9 +226,8 @@ func (s *RecommendationService) GetFollowingBasedRecommendations(
 	}
 
 	// 步骤5：组装响应数据
-	response := &dto.RecommendationResponse{
-		Recommendations: make([]*dto.UserRecommendationDTO, 0, len(topRecommendations)),
-	}
+	response := &dto.RecommendationResponse{}
+	response.Recommendations = make([]*dto.UserRecommendationDTO, 0, len(topRecommendations))
 
 	for _, rec := range topRecommendations {
 		// 获取用户详情

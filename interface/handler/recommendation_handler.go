@@ -93,7 +93,8 @@ func (h *RecommendationHandler) GetFollowingBasedRecommendations(
 	}
 
 	// 转换为 RPC 响应
-	return h.convertToRPCResponse(result), nil
+	res := h.convertToRPCResponse(result)
+	return res, nil
 }
 
 // convertToRPCResponse 辅助方法：DTO -> RPC 响应转换

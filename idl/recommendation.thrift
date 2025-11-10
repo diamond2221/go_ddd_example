@@ -4,6 +4,7 @@ namespace go recommendation
 struct GetRecommendationsRequest {
     1: required i64 user_id,  // 用户ID
     2: optional i32 limit = 10,  // 返回数量限制
+    3: optional i32 day = 7, // 时间范围 (7 天)
 }
 
 // 推荐响应
